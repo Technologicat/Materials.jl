@@ -10,69 +10,427 @@ import ..Utilities: Symm2, Symm4, isotropic_elasticity_tensor, isotropic_complia
 import ..integrate_material!  # for method extension
 
 # parametrically polymorphic for any type representing ℝ
-export GenericChabocheThermal, GenericChabocheThermalDriverState, GenericChabocheThermalParameterState, GenericChabocheThermalVariableState
+# TODO: exports
+#export GenericChabocheThermal, DriverState, GenericChabocheThermalParameterState, GenericChabocheThermalVariableState
 
 # specialization for Float64
-export ChabocheThermal, ChabocheThermalDriverState, ChabocheThermalParameterState, ChabocheThermalVariableState
+#export ChabocheThermal, ChabocheThermalDriverState, ChabocheThermalParameterState, ChabocheThermalVariableState
 
 """Rank-2 identity tensor in three spatial dimensions."""
 I2 = Symm2(I(3))
 
-@with_kw mutable struct GenericChabocheThermalDriverState{T <: Real} <: AbstractMaterialState
+# --------------------------------------------------------------------------------
+# Utilities for declaring temperature-dependent material parameters
+
+# TODO: We provide constant and capped linear for now; other kinds?
+#       OTOH, any one-parameter function will do, so we probably
+#       only need to cover the most common cases here.
+#
+# TODO: Ideally we want to support interpolation objects from `Interpolations.jl`.
+#       https://juliamath.github.io/Interpolations.jl/latest/interpolations/
+
+function constant(value::Real)
+    function interpolate_constant(theta::Real)
+        # `theta` may be a `ForwardDiff.Dual` even when `value` is a float.
+        return convert(typeof(theta), value)
+    end
+    return interpolate_constant
+end
+
+function linear(theta1::Real, value1::Real, theta2::Real, value2::Real)
+    if theta1 > theta2
+        theta1, theta2 = theta2, theta1
+        value1, value2 = value2, value1
+    end
+    dtheta = theta2 - theta1
+    dtheta > 0 || error("must have abs(theta2 - theta1) > 0")
+    dvalue = value2 - value1
+    function interpolate_linear(theta::Real)
+        alpha = (theta - theta1) / dtheta
+        alpha = max(0, min(alpha, 1))
+        return value1 + alpha * dvalue
+    end
+    return interpolate_linear
+end
+
+# --------------------------------------------------------------------------------
+# Type hierarchy for modular material model
+
+abstract type MaterialModel <: AbstractMaterialState end  # complete (top-level) material model
+abstract type ModelComponent <: MaterialModel end  # hierarchical submodel of a material model
+
+abstract type ElasticModel <: ModelComponent end
+abstract type ThermalModel <: ModelComponent end
+abstract type PlasticModel <: ModelComponent end  # covers both plasticity and viscoplasticity
+
+abstract type PlasticResponseModel <: ModelComponent end  # e.g. pure plasticity or overstress viscoplasticity
+
+abstract type HardeningModel <: ModelComponent end
+abstract type KinematicHardeningModel <: HardeningModel end
+abstract type IsotropicHardeningModel <: HardeningModel end
+
+@with_kw mutable struct DriverState{T <: Real} <: AbstractMaterialState
     time::T = zero(T)
     strain::Symm2{T} = zero(Symm2{T})
     temperature::T = zero(T)
 end
 
-# TODO: hierarchize parameters: elasticity, kinematic hardening, isotropic hardening, ...
-# plasticity: yield criterion, flow rule, hardening
-"""Parameter state for ChabocheThermal material.
+abstract type ParameterState <: AbstractMaterialState end
+abstract type VariableState <: AbstractMaterialState end
+abstract type JacobianState <: VariableState end  # separate type for introspection
 
-The classical viscoplastic material is a special case of this model with `C1 = C2 = C3 = 0`.
+# --------------------------------------------------------------------------------
 
-Maximum hardening for each backstress is `Cj / Dj`.
+@with_kw struct BasicMaterialVariableState{T <: Real} <: VariableState
+    stress::Symm2{T} = zero(Symm2{T})  # [N/mm^2]
+end
 
-Any parameter that is a `Function` should takes a single argument, the absolute
-temperature.
+@with_kw struct BasicMaterialJacobianState{T <: Real} <: JacobianState
+    dstressdstrain::Symm4{T} = zero(Symm4{T})
+    dstressdtemperature::Symm2{T} = zero(Symm2{T})
+end
 
-- `theta0`: reference temperature at which thermal expansion is considered zero
-- `E`: Young's modulus [N/mm^2]
-- `nu`: Poisson's ratio
-- `alpha`: linear thermal expansion coefficient
-- `R0`: initial yield strength
-- `tvp`: viscoplastic pseudo-relaxation-time (has the units of time)
-- `Kn`: drag stress (has the units of stress)
-- `nn`: Norton-Bailey power law exponent
-- `C1`, `D1`: parameters governing behavior of backstress X1.
-  C1 has the units of stress; D1 is dimensionless.
-- `C2`, `D2`: parameters governing behavior of backstress X2.
-- `C3`, `D3`: parameters governing behavior of backstress X3.
-- `Q`: isotropic hardening saturation state (has the units of stress)
-- `b`: rate of convergence to isotropic hardening saturation (dimensionless)
-"""
-@with_kw struct GenericChabocheThermalParameterState{T <: Real} <: AbstractMaterialState
-    theta0::T = zero(T)  # reference temperature for thermal behavior
-    # basic material parameters
-    E::Function = (theta::Real -> zero(T))
-    nu::Function = (theta::Real -> zero(T))
-    alpha::Function = (theta::Real -> zero(T))
-    R0::Function = (theta::Real -> zero(T))
-    # parameters for viscoplastic overstress model
-    tvp::T = zero(T)
-    Kn::Function = (theta::Real -> zero(T))
-    nn::Function = (theta::Real -> zero(T))
-    # kinematic hardening parameters
-    C1::Function = (theta::Real -> zero(T))
-    D1::Function = (theta::Real -> zero(T))
+@with_kw struct ThermoElastoPlasticModel{T <: Real} <: MaterialModel
+    # TODO: drivers don't really belong inside the material model.
+    drivers::DriverState{T} = DriverState{T}()
+    ddrivers::DriverState{T} = DriverState{T}()
+    # top-level state variables that don't belong to any specific submodel
+    variables::VariableState = BasicMaterialVariableState{T}()
+    variables_new::VariableState = BasicMaterialVariableState{T}()
+    jacobians::JacobianState = BasicMaterialJacobianState{T}()
+    # submodels
+    # naming: e.g. `mat.elastic.parameters.E`, `mat.thermal.parameters.theta0`, `mat.plastic.variables.strain`
+    elastic::ElasticModel = IsotropicLinearElasticModel{T}()
+    thermal::Union{ThermalModel, Nothing} = IsotropicThermalModel{T}()
+    plastic::PlasticModel = ChabocheModel{T}()  # TODO: make plastic submodel optional
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct IsotropicLinearElasticParameterState{T <: Real} <: ParameterState
+    E::Function = (theta::Real -> zero(T))  # Young's modulus [N/mm^2]
+    nu::Function = (theta::Real -> zero(T))  # Poisson ratio [dimensionless]
+end
+
+# TODO: generalize symmetry group
+@with_kw struct IsotropicLinearElasticModel{T <: Real} <: ElasticModel
+    parameters::ParameterState = IsotropicLinearElasticParameterState{T}()
+    # no variables (elastic strain not stored; to get, invert Hooke's law using stress and elastic parameters)
+end
+
+function elasticity_tensor(parameters::IsotropicLinearElasticParameterState, theta::Real)
+    E, nu = @unpack parameters
+    lambda, mu = lame(E(theta), nu(theta))
+    return isotropic_elasticity_tensor(lambda, mu)
+end
+
+function compliance_tensor(parameters::IsotropicLinearElasticParameterState, theta::Real)
+    E, nu = @unpack parameters
+    lambda, mu = lame(E(theta), nu(theta))
+    return isotropic_compliance_tensor(lambda, mu)
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct IsotropicThermalParameterState{T <: Real} <: ParameterState
+    theta0::T = zero(T)  # reference temperature for thermal behavior [K]
+    alpha::Function = (theta::Real -> zero(T))  # linear thermal expansion coefficient [m / (m K)] = [1 / K]
+end
+
+# TODO: generalize symmetry group
+@with_kw struct IsotropicThermalModel{T <: Real} <: ThermalModel
+    parameters::ParameterState = IsotropicThermalParameterState{T}()
+    # no variables (thermal strain not stored; to get, call `thermal_strain_tensor`)
+end
+
+function thermal_strain_tensor(parameters::IsotropicThermalParameterState, theta::Real)
+    theta0, alpha = @unpack parameters
+    return alpha(theta) * (theta - theta0) * I2
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct BasicPlasticParameterState{T <: Real} <: ParameterState
+    R0::Function = (theta::Real -> zero(T))  # initial yield strength [N/mm^2]
+    f::Function = ((mat::ThermoElastoPlasticModel) -> zero(T))  # yield criterion
+end
+
+@with_kw struct BasicPlasticVariableState{T <: Real} <: VariableState
+    strain::Symm2{T} = zero(Symm2{T})  # plastic part of strain tensor (`mat.plastic.variables.strain`)
+    cumeq::T = zero(T)  # cumulative equivalent plastic strain (scalar, ≥ 0)
+end
+
+# TODO: parameterize flow rule
+@with_kw struct ChabocheModel{T <: Real} <: PlasticModel
+    parameters::ParameterState = BasicPlasticParameterState{T}()
+    variables::VariableState = BasicPlasticVariableState{T}()
+    variables_new::VariableState = BasicPlasticVariableState{T}()
+    response::PlasticResponseModel = NortonBaileyOverstressModel{T}
+    kinematichardening::Union{KinematicHardeningModel, Nothing} = MultipleBackstressModel{T}
+    isotropichardening::Union{IsotropicHardeningModel, Nothing} = ExponentiallySaturatingModel{T}
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct NortonBaileyParameterState{T <: Real} <: ParameterState
+    tvp::T = zero(T)  # viscoplastic pseudo-relaxation-time [s]
+    Kn::Function = (theta::Real -> zero(T))  # drag stress [N/mm^2]
+    nn::Function = (theta::Real -> zero(T))  # Norton-Bailey power law exponent [dimensionless]
+    overstress_function::Function = ((mat::ThermoElastoPlasticModel) -> zero(T))  # needs yield function, mat. parameters
+end
+
+@with_kw struct NortonBaileyOverstressModel{T <: Real} <: PlasticResponseModel
+    parameters::ParameterState = NortonBaileyParameterState{T}()
+    # no variables, the overstress is a temporary quantity used in computing dotp for the residual equations.
+end
+
+@with_kw struct PurePlasticityModel{T <: Real} <: PlasticResponseModel
+    # no parameters, no variables; dotp will be solved such that the consistency condition is fulfilled.
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct MultipleBackstressParameterState{T <: Real} <: ParameterState
+    C1::Function = (theta::Real -> zero(T))  # backstress 1 evolution strength [N/mm^2]
+    D1::Function = (theta::Real -> zero(T))  # backstress 1 relaxation strength [dimensionless]
     C2::Function = (theta::Real -> zero(T))
     D2::Function = (theta::Real -> zero(T))
     C3::Function = (theta::Real -> zero(T))
     D3::Function = (theta::Real -> zero(T))
-    # isotropic hardening parameters
-    Q::Function = (theta::Real -> zero(T))
-    b::Function = (theta::Real -> zero(T))
 end
 
+@with_kw struct MultipleBackstressVariableState{T <: Real} <: VariableState
+    X1::Symm2{T} = zero(Symm2{T})  # backstress 1 [N/mm^2]
+    X2::Symm2{T} = zero(Symm2{T})
+    X3::Symm2{T} = zero(Symm2{T})
+end
+
+# TODO: do we need this part of the algorithmic jacobian?
+@with_kw struct MultipleBackstressJacobianState{T <: Real} <: JacobianState
+    dX1dstrain::Symm4{T} = zero(Symm4{T})
+    dX2dstrain::Symm4{T} = zero(Symm4{T})
+    dX3dstrain::Symm4{T} = zero(Symm4{T})
+    dX1dtemperature::Symm2{T} = zero(Symm2{T})
+    dX2dtemperature::Symm2{T} = zero(Symm2{T})
+    dX3dtemperature::Symm2{T} = zero(Symm2{T})
+end
+
+@with_kw struct MultipleBackstressModel{T <: Real} <: KinematicHardeningModel
+    parameters::ParameterState = MultipleBackstressParameterState{T}()
+    variables::VariableState = MultipleBackstressVariableState{T}()
+    variables_new::VariableState = MultipleBackstressVariableState{T}()
+    jacobians::JacobianState = MultipleBackstressJacobianState{T}()
+end
+
+# --------------------------------------------------------------------------------
+
+@with_kw struct ExponentiallySaturatingParameterState{T <: Real} <: ParameterState
+    Q::Function = (theta::Real -> zero(T))  # isotropic hardening saturation state [N/mm^2]
+    b::Function = (theta::Real -> zero(T))  # rate of convergence to isotropic hardening saturation [dimensionless]
+end
+
+@with_kw struct ExponentiallySaturatingVariableState{T <: Real} <: VariableState
+    R::T = zero(T)  # (current value of) yield strength [N/mm^2]
+end
+
+# TODO: do we need this part of the algorithmic jacobian?
+@with_kw struct ExponentiallySaturatingJacobianState{T <: Real} <: JacobianState
+    dRdstrain::Symm2{T} = zero(Symm2{T})
+    dRdtemperature::T = zero(T)
+end
+
+@with_kw struct ExponentiallySaturatingModel{T <: Real} <: IsotropicHardeningModel
+    parameters::ParameterState = ExponentiallySaturatingParameterState{T}()
+    variables::VariableState = ExponentiallySaturatingVariableState{T}()
+    variables_new::VariableState = ExponentiallySaturatingVariableState{T}()
+    jacobians::JacobianState = ExponentiallySaturatingJacobianState{T}()
+end
+
+# --------------------------------------------------------------------------------
+
+"""Get all `:parameters`, `:variables` or `:jacobians` of a material model.
+
+Return value is a rank-1 array containing the object instances.
+"""
+function walk(root::MaterialModel,
+              kind::Symbol=:parameters)::Array{AbstractMaterialState, 1}
+    out = []
+    function rec!(node)
+        for name in fieldnames(typeof(node))
+            obj = getfield(node, name)
+            if obj isa ModelComponent
+                rec!(obj)
+            elseif name === kind
+                push!(out, obj)
+            end
+        end
+    end
+    rec!(root)
+    return out
+end
+
+# marshaling helper:
+# [variables, ...] -> [(obj, :scalar), (obj, :symm2), ...]
+function spec(variabless::Array{AbstractMaterialState, 1})
+    out = []
+    for variables in variabless
+        for field in fieldnames(typeof(variables))
+            T = typeof(field)
+            if T isa Real
+                push!(out, (field, :scalar))
+            elseif T isa Symm2{<:Real}
+                push!(out, (field, :symm2))
+            elseif T isa Symm4{<:Real}
+                push!(out, (field, :symm4))
+            else
+                error("unrecognized field type in material model variables: $(T)")
+            end
+        end
+    end
+    return out
+end
+
+function marshal(root::MaterialModel,
+                 kind::Symbol=:parameters)
+    variabless = walk(root, :variables)
+    thespec = spec(variabless)
+    out = []
+    for variable, type in thespec
+        if type === :scalar
+            marshaled = variable
+        elseif type === :symm2
+            marshaled = tovoigt(variable)::Array{<:Real, 1}
+        else  # type === :symm4
+            marshaled = reshape(tovoigt(variable), :)::Array{<:Real, 1}
+        end
+        push!(out, marshaled)
+    end
+    return out
+end
+
+function unmarshal(data::Array{<:Real, 1}, thespec)
+    T = eltype(data)
+    j = 1
+    for variable, type in thespec
+        if type === :scalar
+            unmarshaled = data[j]
+            j += 1
+            error("TODO")
+        elseif type === :symm2
+            unmarshaled = fromvoigt(Symm2{T}, @view data[j:(j + 5)])
+            j += 6
+            error("TODO")
+        else  # type === :symm4
+            voigt = reshape(@view data[j:(j + 35)], 6, 6)  # TODO: @view?
+            unmarshaled = fromvoigt(Symm4{T}, voigt)
+            j += 36
+            error("TODO")
+        end
+        # TODO: where do we write the unmarshaled data?
+    end
+    error("TODO")
+end
+
+# --------------------------------------------------------------------------------
+
+# TODO: update docstrings and place them where they belong
+"""Parameter state for ChabocheThermal material.
+
+Any parameter that is a `Function` takes a single argument, the absolute
+temperature `theta` [K].
+
+- `E`: Young's modulus [N/mm^2]
+- `nu`: Poisson's ratio (dimensionless)
+- `theta0`: reference temperature at which thermal expansion is considered zero [K]
+- `alpha`: linear thermal expansion coefficient [m / (m K)] = [1 / K]
+"""
+
+"""The plasticity model determines the type of plastic response.
+
+A pure plastic model limits the effective stress to the closed region delimited
+by the yield surface. The effective plastic strain rate (`dotp`) is computed
+such that the consistency condition is fulfilled. That is, once yield has been
+reached and plastic deformation takes place, the new state will be on the
+updated yield surface.
+
+A viscoplastic overstress model allows the effective stress to temporarily cross
+the yield surface. The effective plastic strain rate (`dotp`) is determined by
+the overstress function.
+"""
+
+
+"""Parameters common to all plasticity models (that we support).
+
+- `R0`: initial yield strength [N/mm^2]
+"""
+
+"""Problem state common to all plasticity models (that we support).
+
+"""
+
+"""Viscoplastic overstress model using a Norton-Bailey power law.
+
+Any parameter that is a `Function` takes a single argument, the absolute
+temperature `theta` [K].
+
+The Norton-Bailey overstress function is::
+
+    1 / tvp * ((f >= 0.0 ? f : 0.0) / Kn)^nn
+
+where
+
+- `tvp`: viscoplastic pseudo-relaxation-time [s]
+- `Kn`: drag stress [N/mm^2]
+- `nn`: Norton-Bailey power law exponent
+
+State variables are:
+
+- `plastic_strain`: plastic part of strain tensor
+- `cumeq`: cumulative equivalent plastic strain (scalar, ≥ 0)
+"""
+
+"""Pure plasticity, no viscous behavior.
+
+The effective plastic strain rate is determined automatically such that when
+plastic deformation occurs, the new state remains on the yield surface.
+"""
+
+"""Chaboche-type kinematic hardening model with up to three backstresses.
+
+If you want to use fewer backstresses, just set the parameters for any
+unused backstresses to zero.
+
+The Armstrong-Frederick model is a special case of this model, with just one
+backstress, `C2 = D2 = C3 = D3 = 0`.
+
+The classical viscoplastic model is a special case of this model with
+`C1 = C2 = C3 = 0`.
+
+Maximum hardening for backstress `j` is `Cj / Dj`.
+
+Any parameter that is a `Function` takes a single argument, the absolute
+temperature `theta` [K].
+
+When plastic deformation occurs, the parameters determine:
+
+- `C1` [N/mm^2]: how strongly backstress 1 moves into the direction of the
+  outward normal of the yield surface.
+- `D1` (dimensionless): how strongly backstress 1 relaxes back toward the
+  origin in the stress space.
+- `C2`, `D2`, `C3`, `D3` similarly for backstresses 2 and 3.
+"""
+
+"""Exponentially saturating isotropic hardening.
+
+Any parameter that is a `Function` takes a single argument, the absolute
+temperature `theta` [K].
+
+- `Q`: isotropic hardening saturation state [N/mm^2]
+- `b`: rate of convergence to isotropic hardening saturation (dimensionless)
+"""
+
+
+# TODO: modularize this; what state we need depends on the models chosen above.
 """Problem state for ChabocheThermal material.
 
 - `stress`: stress tensor
@@ -130,8 +488,8 @@ end
 end
 
 @with_kw mutable struct GenericChabocheThermal{T <: Real} <: AbstractMaterial
-    drivers::GenericChabocheThermalDriverState{T} = GenericChabocheThermalDriverState{T}()
-    ddrivers::GenericChabocheThermalDriverState{T} = GenericChabocheThermalDriverState{T}()
+    drivers::DriverState{T} = DriverState{T}()
+    ddrivers::DriverState{T} = DriverState{T}()
     variables::GenericChabocheThermalVariableState{T} = GenericChabocheThermalVariableState{T}()
     variables_new::GenericChabocheThermalVariableState{T} = GenericChabocheThermalVariableState{T}()
     parameters::GenericChabocheThermalParameterState{T} = GenericChabocheThermalParameterState{T}()
@@ -139,7 +497,7 @@ end
     options::ChabocheThermalOptions = ChabocheThermalOptions()
 end
 
-ChabocheThermalDriverState = GenericChabocheThermalDriverState{Float64}
+ChabocheThermalDriverState = DriverState{Float64}
 ChabocheThermalParameterState = GenericChabocheThermalParameterState{Float64}
 ChabocheThermalVariableState = GenericChabocheThermalVariableState{Float64}
 ChabocheThermal = GenericChabocheThermal{Float64}
@@ -229,7 +587,7 @@ end
 # For `yield_jacobian`, that leads to nested uses of `ForwardDiff`.
 """
     yield_criterion(state::GenericChabocheThermalVariableState{<:Real},
-                    drivers::GenericChabocheThermalDriverState{<:Real},
+                    drivers::DriverState{<:Real},
                     parameters::GenericChabocheThermalParameterState{<:Real})
 
 Temperature-dependent yield criterion. This particular one is the von Mises
@@ -245,7 +603,7 @@ Other properties of the structures are not used by this function.
 The return value is a scalar, the value of the yield function `f`.
 """
 function yield_criterion(state::GenericChabocheThermalVariableState{<:Real},
-                         drivers::GenericChabocheThermalDriverState{<:Real},
+                         drivers::DriverState{<:Real},
                          parameters::GenericChabocheThermalParameterState{<:Real})
     @unpack stress, R, X1, X2, X3 = state
     @unpack temperature = drivers
@@ -258,7 +616,7 @@ end
 
 """
     yield_jacobian(state::GenericChabocheThermalVariableState{<:Real},
-                   drivers::GenericChabocheThermalDriverState{<:Real},
+                   drivers::DriverState{<:Real},
                    parameters::GenericChabocheThermalParameterState{<:Real})
 
 Compute `n = ∂f/∂σ`.
@@ -272,7 +630,7 @@ Other properties of the structures are not used by this function.
 The return value is the symmetric rank-2 tensor `n`.
 """
 function yield_jacobian(state::GenericChabocheThermalVariableState{<:Real},
-                        drivers::GenericChabocheThermalDriverState{<:Real},
+                        drivers::DriverState{<:Real},
                         parameters::GenericChabocheThermalParameterState{<:Real})
     # We only need ∂f/∂σ, so let's compute only that to make this run faster.
     #
@@ -314,7 +672,7 @@ end
 
 """
     overstress_function(state::GenericChabocheThermalVariableState{<:Real},
-                           drivers::GenericChabocheThermalDriverState{<:Real},
+                           drivers::DriverState{<:Real},
                            parameters::GenericChabocheThermalParameterState{<:Real})
 
 Norton-Bailey type power law.
@@ -328,7 +686,7 @@ Additionally, `state`, `drivers` and `parameters` will be passed to
 The return value is `dotp` that can be used in `dp = dotp * dtime`.
 """
 function overstress_function(state::GenericChabocheThermalVariableState{<:Real},
-                             drivers::GenericChabocheThermalDriverState{<:Real},
+                             drivers::DriverState{<:Real},
                              parameters::GenericChabocheThermalParameterState{<:Real})
     f = yield_criterion(state, drivers, parameters)
     @unpack tvp, Kn, nn = parameters
@@ -409,7 +767,7 @@ function integrate_material!(material::GenericChabocheThermal{T}) where T <: Rea
     @unpack stress, X1, X2, X3, plastic_strain, cumeq, R = v
 
     VariableState{U} = GenericChabocheThermalVariableState{U}
-    DriverState{U} = GenericChabocheThermalDriverState{U}
+    DriverState{U} = DriverState{U}
     ff(sigma, R, X1, X2, X3, theta) = yield_criterion(VariableState{T}(stress=sigma, R=R, X1=X1, X2=X2, X3=X3),
                                                       DriverState{T}(temperature=theta),
                                                       p)
@@ -627,7 +985,7 @@ function create_nonlinear_system_of_equations(material::GenericChabocheThermal{T
     bf = p.b
 
     VariableState{U} = GenericChabocheThermalVariableState{U}
-    DriverState{U} = GenericChabocheThermalDriverState{U}
+    DriverState{U} = DriverState{U}
     # n = ∂f/∂σ
     nf(sigma, R, X1, X2, X3, theta) = yield_jacobian(VariableState{eltype(sigma)}(stress=sigma, R=R, X1=X1, X2=X2, X3=X3),
                                                      DriverState{typeof(theta)}(temperature=theta),
