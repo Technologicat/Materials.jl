@@ -100,12 +100,16 @@ end
     jacobians::JacobianState = BasicMaterialJacobianState{T}()
     # submodels
     # naming: e.g. `mat.elastic.parameters.E`, `mat.thermal.parameters.theta0`, `mat.plastic.variables.strain`
+    # TODO: support a list of generic models to build custom models
+    # TODO: what about piecewise defined models? (e.g. inside or outside plastic region)
     elastic::ElasticModel = IsotropicLinearElasticModel{T}()
     thermal::Union{ThermalModel, Nothing} = IsotropicThermalModel{T}()
     plastic::PlasticModel = ChabocheModel{T}()  # TODO: make plastic submodel optional
 end
 
 # --------------------------------------------------------------------------------
+
+# TODO: ODEs/DAEs as part of the model struct?
 
 @with_kw struct IsotropicLinearElasticParameterState{T <: Real} <: ParameterState
     E::Function = (theta::Real -> zero(T))  # Young's modulus [N/mm^2]
@@ -153,10 +157,14 @@ end
 @with_kw struct BasicPlasticParameterState{T <: Real} <: ParameterState
     R0::Function = (theta::Real -> zero(T))  # initial yield strength [N/mm^2]
     f::Function = ((mat::ThermoElastoPlasticModel) -> zero(T))  # yield criterion
+    # TODO: non-associative plasticity models?
 end
+
+# TODO: crystal plasticity models require multiple additively composed plastic strains (and several plasticity potentials)
 
 @with_kw struct BasicPlasticVariableState{T <: Real} <: VariableState
     strain::Symm2{T} = zero(Symm2{T})  # plastic part of strain tensor (`mat.plastic.variables.strain`)
+    # TODO: do we want cumeq here?
     cumeq::T = zero(T)  # cumulative equivalent plastic strain (scalar, ≥ 0)
 end
 
@@ -165,9 +173,10 @@ end
     parameters::ParameterState = BasicPlasticParameterState{T}()
     variables::VariableState = BasicPlasticVariableState{T}()
     variables_new::VariableState = BasicPlasticVariableState{T}()
-    response::PlasticResponseModel = NortonBaileyOverstressModel{T}
-    kinematichardening::Union{KinematicHardeningModel, Nothing} = MultipleBackstressModel{T}
-    isotropichardening::Union{IsotropicHardeningModel, Nothing} = ExponentiallySaturatingModel{T}
+    response::PlasticResponseModel = NortonBaileyOverstressModel{T}()
+    # TODO: support several hardening models per type - list of generic models here too?
+    kinematichardening::Union{KinematicHardeningModel, Nothing} = MultipleBackstressModel{T}()
+    isotropichardening::Union{IsotropicHardeningModel, Nothing} = ExponentiallySaturatingModel{T}()
 end
 
 # --------------------------------------------------------------------------------
@@ -179,16 +188,20 @@ end
     overstress_function::Function = ((mat::ThermoElastoPlasticModel) -> zero(T))  # needs yield function, mat. parameters
 end
 
+# TODO: move overstress function here, dispatch by type
+
 @with_kw struct NortonBaileyOverstressModel{T <: Real} <: PlasticResponseModel
     parameters::ParameterState = NortonBaileyParameterState{T}()
     # no variables, the overstress is a temporary quantity used in computing dotp for the residual equations.
 end
 
-@with_kw struct PurePlasticityModel{T <: Real} <: PlasticResponseModel
+@with_kw struct InviscidPlasticityModel{T <: Real} <: PlasticResponseModel
     # no parameters, no variables; dotp will be solved such that the consistency condition is fulfilled.
 end
 
 # --------------------------------------------------------------------------------
+
+# TODO: convert to single backstress model (Armstrong-Frederick), allow several of them
 
 @with_kw struct MultipleBackstressParameterState{T <: Real} <: ParameterState
     C1::Function = (theta::Real -> zero(T))  # backstress 1 evolution strength [N/mm^2]
