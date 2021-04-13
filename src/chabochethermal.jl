@@ -81,6 +81,8 @@ abstract type JacobianState <: VariableState end  # separate type for introspect
 
 # --------------------------------------------------------------------------------
 
+# TODO: some structs here must be mutable so that the solver can update the `variables_new` fields.
+
 @with_kw struct BasicMaterialVariableState{T <: Real} <: VariableState
     stress::Symm2{T} = zero(Symm2{T})  # [N/mm^2]
 end
@@ -261,87 +263,164 @@ end
 
 # --------------------------------------------------------------------------------
 
-"""Get all `:parameters`, `:variables` or `:jacobians` of a material model.
+# needed by unmarshal!
+"""Recursive `setproperty!` for container onions.
 
-Return value is a rank-1 array containing the object instances.
+For example, `recsetproperty!(obj, "a.b.c", x)` means `obj.a.b.c = x`.
+
+The point of having this function is that the path is computable.
 """
-function walk(root::MaterialModel,
-              kind::Symbol=:parameters)::Array{AbstractMaterialState, 1}
+function recsetproperty!(value, fullname, x)
+    thing, name = _recresolve(value, fullname)
+    return setproperty!(thing, name, x)
+end
+
+# for symmetry; currently unused
+"""Recursive `getproperty` for container onions.
+
+For example, `recgetproperty(obj, "a.b.c")` returns `obj.a.b.c`.
+
+The point of having this function is that the path is computable.
+"""
+function recgetproperty(value, fullname)
+    thing, name = _recresolve(value, fullname)
+    return getproperty(thing, name, x)
+end
+
+"""Resolve dotted name in a container onion.
+
+For example, `_recresolve(obj, "a.b.c")` returns `(obj.a.b, :c)`.
+
+The points of having this function are that the path is computable, and that
+you can then separately decide whether to get or set that last component.
+"""
+function _recresolve(root, fullname)
+    path, lastcomponent = rsplit(fullname, "."; limit=1)
+    thing = root
+    for component in split(path, ".")
+        thing = getproperty(thing, component)
+    end
+    return thing, Symbol(lastcomponent)
+end
+
+
+"""Extract all parameters, variables or jacobians from a material model.
+
+`root`: `MaterialModel` or `ModelComponent` instance to start from.
+        This specifies the top level of the walk.
+
+`kind`: one of `ParameterState`, `VariableState` or `JacobianState`.
+
+Return value is a rank-1 Array: [(path, collection), ...]
+
+where `path` is the fully qualified ("dotted") name of `collection` inside `root`.
+For example, if `root` is the top-level `MaterialModel`, path may contain something
+like "elastic.parameters" or "plastic.variables" (depending on the `kind` of collections
+being extracted).
+
+The output can be flattened into individual fields with `flatten_collections`.
+See also `walk_fields` to perform both steps at once.
+"""
+function walk_model(root::MaterialModel, kind::Type)::Array{AbstractMaterialState, 1}
     out = []
-    function rec!(node)
+    function rec!(node, path)
+        prefix = (length(path) > 0) ? "$(path)." : ""
         for name in fieldnames(typeof(node))
-            obj = getfield(node, name)
-            if obj isa ModelComponent
-                rec!(obj)
-            elseif name === kind
-                push!(out, obj)
+            fullname = "$(prefix)$(name)"  # e.g. "elastic.parameters"
+            thing = getproperty(node, name)
+            if thing isa ModelComponent
+                rec!(thing, fullname)
+            elseif thing isa kind
+                push!(out, (fullname, thing))
             end
         end
     end
-    rec!(root)
+    rec!(root, "")
     return out
 end
 
-# marshaling helper:
-# [variables, ...] -> [(obj, :scalar), (obj, :symm2), ...]
-function spec(variabless::Array{AbstractMaterialState, 1})
+
+"""Flatten collections of fields into a vector of individual fields.
+
+[(path, collection), ...] -> [(path, field), (path, field), ...]
+
+The input format is the output of `walk_model`.
+See also `walk_fields` to perform both steps at once.
+"""
+function flatten_collections(collections::Array{Tuple{String, AbstractMaterialState}, 1})
     out = []
-    for variables in variabless
-        for field in fieldnames(typeof(variables))
-            T = typeof(field)
-            if T isa Real
-                push!(out, (field, :scalar))
-            elseif T isa Symm2{<:Real}
-                push!(out, (field, :symm2))
-            elseif T isa Symm4{<:Real}
-                push!(out, (field, :symm4))
-            else
-                error("unrecognized field type in material model variables: $(T)")
-            end
+    for (path, collection) in collections
+        prefix = (length(path) > 0) ? "$(path)." : ""
+        for name in fieldnames(typeof(collection))
+            fullname = "$(prefix)$(name)"  # e.g. "elastic.parameters.E"
+            field = getproperty(collection, name)
+            push!(out, (fullname, field))
         end
     end
     return out
 end
 
-function marshal(root::MaterialModel,
-                 kind::Symbol=:parameters)
-    variabless = walk(root, :variables)
-    thespec = spec(variabless)
+
+"""Convenience function, `walk_fields(...) = flatten_collections(walk_model(...))`.
+
+The output is suitable as `fields` for `marshal` and `unmarshal!`.
+
+CAUTION: When unmarshaling, be sure to use the same `fields` you passed in when
+originally marshaling the data.
+"""
+walk_fields(root:MaterialModel, kind::Type) = flatten_collections(walk_model(root, kind))
+
+
+"""Marshal numerical data from a hierarchical model into a rank-1 Array.
+
+Use `walk_fields` to get `fields` from a model.
+"""
+function marshal(fields::Array{Tuple{String, Any}, 1})
     out = []
-    for variable, type in thespec
-        if type === :scalar
-            marshaled = variable
-        elseif type === :symm2
-            marshaled = tovoigt(variable)::Array{<:Real, 1}
-        else  # type === :symm4
-            marshaled = reshape(tovoigt(variable), :)::Array{<:Real, 1}
+    for fullname, field in fields
+        fieldtype = typeof(field)
+        if fieldtype <: Real
+            marshaled = field
+        elseif fieldtype <: Symm2{<:Real}
+            marshaled = tovoigt(field)::Array{<:Real, 1}
+        elseif fieldtype <: Symm4{<:Real}
+            marshaled = reshape(tovoigt(field), :)::Array{<:Real, 1}
+        else
+            error("unrecognized field type when marshaling material model: '$(fullname)' has type $(fieldtype)")
         end
         push!(out, marshaled)
     end
     return out
 end
 
-function unmarshal(data::Array{<:Real, 1}, thespec)
+
+"""Unmarshal numerical data from a rank-1 Array, `data`, into a hierarchical model.
+
+`fields` specifies where to write the data in `target`. It must be the same `fields`
+that was used to `marshal` the data.
+"""
+function unmarshal!(target::MaterialModel, fields::Array{Tuple{String, Any}, 1}, data::Array{<:Real, 1})
     T = eltype(data)
     j = 1
-    for variable, type in thespec
-        if type === :scalar
+    for fullname, oldfield in fields
+        fieldtype = typeof(oldfield)
+        if fieldtype <: Real
             unmarshaled = data[j]
             j += 1
-            error("TODO")
-        elseif type === :symm2
+        elseif fieldtype <: Symm2{<:Real}
             unmarshaled = fromvoigt(Symm2{T}, @view data[j:(j + 5)])
             j += 6
-            error("TODO")
-        else  # type === :symm4
-            voigt = reshape(@view data[j:(j + 35)], 6, 6)  # TODO: @view?
+        elseif fieldtype <: Symm4{<:Real}
+            voigt = reshape(@view data[j:(j + 35)], 6, 6)
             unmarshaled = fromvoigt(Symm4{T}, voigt)
             j += 36
-            error("TODO")
+        else
+            error("unrecognized field type when unmarshaling material model: '$(fullname)' has type $(fieldtype)")
         end
-        # TODO: where do we write the unmarshaled data?
+        recsetproperty!(target, fullname, unmarshaled)
     end
-    error("TODO")
+    (j == length(data) + 1) || error("Marshaled data remaining after unmarshal completed; data length = $(length(data)), first index not unmarshaled = $(j)")
+    return nothing
 end
 
 # --------------------------------------------------------------------------------
