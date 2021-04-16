@@ -104,6 +104,9 @@ end
     # naming: e.g. `mat.elastic.parameters.E`, `mat.thermal.parameters.theta0`, `mat.plastic.variables.strain`
     # TODO: support a list of generic models to build custom models
     # TODO: what about piecewise defined models? (e.g. inside or outside plastic region)
+    #
+    # TODO: The main problem with that idea is that model components depend on each other to some degree.
+    # TODO: So for now we have just three models with specific roles.
     elastic::ElasticModel = IsotropicLinearElasticModel{T}()
     thermal::Union{ThermalModel, Nothing} = IsotropicThermalModel{T}()
     plastic::PlasticModel = ChabocheModel{T}()  # TODO: make plastic submodel optional
@@ -176,9 +179,10 @@ end
     variables::VariableState = BasicPlasticVariableState{T}()
     variables_new::VariableState = BasicPlasticVariableState{T}()
     response::PlasticResponseModel = NortonBaileyOverstressModel{T}()
-    # TODO: support several hardening models per type - list of generic models here too?
-    kinematichardening::Union{KinematicHardeningModel, Nothing} = MultipleBackstressModel{T}()
-    isotropichardening::Union{IsotropicHardeningModel, Nothing} = ExponentiallySaturatingModel{T}()
+    kinematichardening::Array{KinematicHardeningModel} = [BackstressModel{T}(),
+                                                          BackstressModel{T}(),
+                                                          BackstressModel{T}()]
+    isotropichardening::Array{IsotropicHardeningModel} = [ExponentiallySaturatingModel{T}()]
 end
 
 # --------------------------------------------------------------------------------
@@ -187,10 +191,7 @@ end
     tvp::T = zero(T)  # viscoplastic pseudo-relaxation-time [s]
     Kn::Function = (theta::Real -> zero(T))  # drag stress [N/mm^2]
     nn::Function = (theta::Real -> zero(T))  # Norton-Bailey power law exponent [dimensionless]
-    overstress_function::Function = ((mat::ThermoElastoPlasticModel) -> zero(T))  # needs yield function, mat. parameters
 end
-
-# TODO: move overstress function here, dispatch by type
 
 @with_kw struct NortonBaileyOverstressModel{T <: Real} <: PlasticResponseModel
     parameters::ParameterState = NortonBaileyParameterState{T}()
@@ -201,40 +202,48 @@ end
     # no parameters, no variables; dotp will be solved such that the consistency condition is fulfilled.
 end
 
-# --------------------------------------------------------------------------------
-
-# TODO: convert to single backstress model (Armstrong-Frederick), allow several of them
-
-@with_kw struct MultipleBackstressParameterState{T <: Real} <: ParameterState
-    C1::Function = (theta::Real -> zero(T))  # backstress 1 evolution strength [N/mm^2]
-    D1::Function = (theta::Real -> zero(T))  # backstress 1 relaxation strength [dimensionless]
-    C2::Function = (theta::Real -> zero(T))
-    D2::Function = (theta::Real -> zero(T))
-    C3::Function = (theta::Real -> zero(T))
-    D3::Function = (theta::Real -> zero(T))
+function overstress_function(mat::ThermoElastoPlasticModel{<:Real})
+    error("Abstract function; must be implemented for each particular model.")
 end
 
-@with_kw struct MultipleBackstressVariableState{T <: Real} <: VariableState
-    X1::Symm2{T} = zero(Symm2{T})  # backstress 1 [N/mm^2]
-    X2::Symm2{T} = zero(Symm2{T})
-    X3::Symm2{T} = zero(Symm2{T})
+function overstress_function(mat::NortonBaileyOverstressModel{<:Real})
+    # TODO: the input isn't enough; needs yield function, mat. parameters
+    ...
+end
+
+function overstress_function(mat::InviscidPlasticityModel{<:Real})
+    # Returning `nothing` here means that dotp should be solved such that the
+    # consistency condition is fulfilled. We can't compute the value here,
+    # because to obtain it, the equation needs to be inserted into the nonlinear
+    # equation system.
+    #
+    # TODO: make it possible to return an equation?
+    return nothing
+end
+
+# --------------------------------------------------------------------------------
+# kinematic hardening with an Armstrong-Frederick type backstress
+
+@with_kw struct BackstressParameterState{T <: Real} <: ParameterState
+    C::Function = (theta::Real -> zero(T))  # evolution strength [N/mm^2]
+    D::Function = (theta::Real -> zero(T))  # relaxation strength [dimensionless]
+end
+
+@with_kw struct BackstressVariableState{T <: Real} <: VariableState
+    X::Symm2{T} = zero(Symm2{T})  # the backstress [N/mm^2]
 end
 
 # TODO: do we need this part of the algorithmic jacobian?
-@with_kw struct MultipleBackstressJacobianState{T <: Real} <: JacobianState
-    dX1dstrain::Symm4{T} = zero(Symm4{T})
-    dX2dstrain::Symm4{T} = zero(Symm4{T})
-    dX3dstrain::Symm4{T} = zero(Symm4{T})
-    dX1dtemperature::Symm2{T} = zero(Symm2{T})
-    dX2dtemperature::Symm2{T} = zero(Symm2{T})
-    dX3dtemperature::Symm2{T} = zero(Symm2{T})
+@with_kw struct BackstressJacobianState{T <: Real} <: JacobianState
+    dXdstrain::Symm4{T} = zero(Symm4{T})
+    dXdtemperature::Symm2{T} = zero(Symm2{T})
 end
 
-@with_kw struct MultipleBackstressModel{T <: Real} <: KinematicHardeningModel
-    parameters::ParameterState = MultipleBackstressParameterState{T}()
-    variables::VariableState = MultipleBackstressVariableState{T}()
-    variables_new::VariableState = MultipleBackstressVariableState{T}()
-    jacobians::JacobianState = MultipleBackstressJacobianState{T}()
+@with_kw struct BackstressModel{T <: Real} <: KinematicHardeningModel
+    parameters::ParameterState = BackstressParameterState{T}()
+    variables::VariableState = BackstressVariableState{T}()
+    variables_new::VariableState = BackstressVariableState{T}()
+    jacobians::JacobianState = BackstressJacobianState{T}()
 end
 
 # --------------------------------------------------------------------------------
@@ -397,7 +406,8 @@ end
 """Unmarshal numerical data from a rank-1 Array, `data`, into a hierarchical model.
 
 `fields` specifies where to write the data in `target`. It must be the same `fields`
-that was used to `marshal` the data.
+that was used to `marshal` the data (strictly, it must contain fields of the same
+types, in the same order).
 """
 function unmarshal!(target::MaterialModel, fields::Array{Tuple{String, Any}, 1}, data::Array{<:Real, 1})
     T = eltype(data)
@@ -419,7 +429,7 @@ function unmarshal!(target::MaterialModel, fields::Array{Tuple{String, Any}, 1},
         end
         recsetproperty!(target, fullname, unmarshaled)
     end
-    (j == length(data) + 1) || error("Marshaled data remaining after unmarshal completed; data length = $(length(data)), first index not unmarshaled = $(j)")
+    (j == 1 + length(data)) || error("Marshaled data remaining after unmarshal completed; data length = $(length(data)), first index not unmarshaled = $(j)")
     return nothing
 end
 
